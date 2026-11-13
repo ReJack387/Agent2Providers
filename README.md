@@ -1,3 +1,5 @@
+扩展 [Provider Enhancement](https://github.com/ProvidersPlugin/Agent2Providers) 支持更多提供商
+
 # Agent2Providers
 
 **English** · [简体中文](README.zh-CN.md)
