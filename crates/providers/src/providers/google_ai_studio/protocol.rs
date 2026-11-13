@@ -12,18 +12,27 @@
 //! 1. `tool` 消息只有 `tool_call_id`，没有函数名；Gemini 的
 //!    `functionResponse` 必须带 `name`。所以要一边扫消息一边记住
 //!    `tool_call_id → name` 的对应关系（assistant 的 `tool_calls` 里给的）。
-//! 2. OpenAI 的 JSON Schema 里有些键 Gemini 不认（`additionalProperties`、
-//!    `$schema`、`strict` 等），留着是硬 400，要递归剥掉。**但只能剥
-//!    schema 对象上的键** —— `properties` 里的键是用户起的参数名，一个叫
-//!    `title` 的参数被剥掉之后 `required` 就指向了不存在的属性，上游会回
-//!    `required[2]: property is not defined`。剥完还要把 `required` 里
-//!    点空的条目一并清掉（客户端给的 schema 本身就可能不自洽）。
+//! 2. OpenAI 的 JSON Schema 与 Gemini 的 `Schema` 不是一回事，必须做一次
+//!    **白名单**过滤（只留 `ALLOWED_SCHEMA_KEYS`）。黑名单补不全 —— 每漏
+//!    一个键就是整条请求 400（`Unknown name "xxx"`），而白名单漏掉的键最多
+//!    少一层约束，请求还能成。
 //!
-//!    同一段路还要处理 `$ref`：Agent 与 MCP 的工具 schema 普遍用
-//!    `$defs` + `$ref` 复用类型，而 `$defs` 本身在禁用表里 —— 只剥不展开
-//!    就会留下一堆悬空引用，上游同样 400。所以 `$ref` 必须**就地展开**成
-//!    真正的 schema（带深度上限兜自引用）。`allOf` 合成分支、`oneOf`
-//!    降级成 `anyOf`（Gemini 认后者），`not` 之类没有对应概念的直接丢。
+//!    这段路有几个坑，每一个都对应过线上 400：
+//!    - 只能过滤 **schema 对象**上的键。`properties` 里的键是参数名，一个叫
+//!      `title` 的参数被删掉之后 `required` 就指向了不存在的属性，上游回
+//!      `required[2]: property is not defined`。
+//!    - 清完要把 `required` 里点空的条目一并剔掉（客户端给的 schema 本身
+//!      就可能不自洽）。
+//!    - **每个节点都必须输出对象**。JSON Schema 允许布尔 schema（`true` /
+//!      `false` / `null` 当整个 schema 用），原样透传会在 `anyOf` 里塞进标量，
+//!      protobuf 解析报 `Starting an object on a scalar field`。
+//!    - `"type": ["string", "null"]` 这种数组型 type 要收成单个枚举值，`null`
+//!      改写成 `nullable: true`；`type` 收数组会报 `Invalid value at ...type`。
+//!    - `$ref` 必须**就地展开**。Agent 与 MCP 的工具 schema 普遍用 `$defs` +
+//!      `$ref` 复用类型，而 `$defs` 本身不在白名单里 —— 只丢不展开就会留下
+//!      悬空引用。展开带深度上限兜自引用。
+//!    - `allOf` 摊平进本层、`oneOf` 降级成 `anyOf`（Gemini 认后者）；`not` /
+//!      `if`+`then`+`else` 之类没有对应概念，白名单外自然丢掉。
 //! 3. 思考档位不能直接塞 `thinkingBudget`：`ReasoningPatch` 只认顶层字段，
 //!    所以绑定先写 body 顶层 `reasoning_effort`，由这里搬进
 //!    `generationConfig.thinkingConfig`。**且只对支持思考的模型发**，
@@ -75,35 +84,86 @@ fn can_disable_thinking(model: &str) -> bool {
 /// pro 系能接受的最小思考预算。
 const PRO_MIN_BUDGET: i64 = 128;
 
-/// Gemini 不认、留着就是硬 400 的 JSON Schema 键。
+/// Gemini `Schema` 认的键。
 ///
-/// 只允许出现在 **schema 对象**上。绝不能拿这张表去筛 `properties` 的键 ——
-/// 那里的键是工具参数名，删掉一个就叫「属性不存在」。
-const UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
-    "additionalProperties",
-    "$schema",
-    "strict",
-    "exclusiveMinimum",
-    "exclusiveMaximum",
-    "const",
-    "$defs",
-    "definitions",
-    // 没有对应概念的组合子：`not` / `if`+`then`+`else` / `dependentSchemas`
-    // 都无法降级，只能丢（丢了最多少一层约束，留着是整条请求 400）。
-    "not",
-    "if",
-    "then",
-    "else",
-    "dependentSchemas",
-    "dependentRequired",
-    // 注释性的键，Gemini 接受但没用，留着只会撑大 schema。
-    "title",
+/// **用白名单而不是黑名单。** 黑名单永远补不全，每漏一个键就是一次整条请求
+/// 400（`Unknown name "xxx"`）；白名单漏掉的键最多少一层约束，请求还能成。
+///
+/// 这些键只允许出现在 **schema 对象**上。绝不能拿这张表去筛 `properties` 的
+/// 键 —— 那里的键是工具参数名，删掉一个就叫「属性不存在」。
+const ALLOWED_SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "format",
+    "description",
+    "nullable",
+    "enum",
+    "items",
+    "properties",
+    "required",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "anyOf",
+];
+
+/// Gemini 的 `format` 只认这几种，别的值会报 `Invalid value at ...format`。
+const ALLOWED_FORMATS: &[&str] = &[
+    "int32",
+    "int64",
+    "float",
+    "double",
+    "byte",
+    "binary",
+    "date-time",
+    "enum",
 ];
 
 /// `$ref` 展开的最大深度。自引用/互引用的 schema 会无限递归，必须兜住。
 const MAX_REF_DEPTH: usize = 8;
 
-/// 剥掉 Gemini 不认的 JSON Schema 键，并把 `$ref` 就地展开。
+/// 把 JSON Schema 的 `type` 收成 Gemini 认的单个枚举值。
+///
+/// JSON Schema 允许 `"type": ["string", "null"]`，而 Gemini 的 `type` 是标量
+/// 枚举 —— 直接把数组塞进去就是 `Invalid value at ...type`。数组里出现
+/// `"null"` 时改用 `nullable: true`（Gemini 有这个字段）。
+fn normalize_type(item: &Value) -> Option<(String, bool)> {
+    let names: Vec<String> = match item {
+        Value::String(text) => vec![text.trim().to_ascii_lowercase()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|text| text.trim().to_ascii_lowercase())
+            .collect(),
+        _ => return None,
+    };
+    if names.is_empty() {
+        return None;
+    }
+    let nullable = names.iter().any(|name| name == "null");
+    let picked = names
+        .iter()
+        .find(|name| name.as_str() != "null")
+        .cloned()
+        .unwrap_or_else(|| String::from("string"));
+    let mapped = match picked.as_str() {
+        "string" | "number" | "integer" | "boolean" | "array" | "object" => picked,
+        // 各种方言里的别名都没有对应枚举值，折到最接近的那个。
+        "float" | "double" => String::from("number"),
+        "int" | "long" | "short" | "byte" => String::from("integer"),
+        "dict" | "map" | "record" => String::from("object"),
+        "list" | "tuple" => String::from("array"),
+        _ => String::from("string"),
+    };
+    Some((mapped, nullable))
+}
+
+/// 剥掉 Gemini 不认的键，展开 `$ref`，把组合子摊平。
 fn sanitize_schema(value: &Value) -> Value {
     let defs = collect_defs(value);
     sanitize_node(value, &defs, 0)
@@ -148,11 +208,11 @@ fn deref(value: &Value, defs: &Map<String, Value>, depth: usize) -> Value {
         return value.clone();
     };
     if depth > MAX_REF_DEPTH {
-        return json!({ "type": "object" });
+        return json!({});
     }
     let resolved = deref(target, defs, depth + 1);
     let Value::Object(mut merged) = resolved else {
-        return resolved;
+        return json!({});
     };
     for (key, item) in map {
         if key == "$ref" {
@@ -242,105 +302,202 @@ fn prune_required(out: &mut Map<String, Value>) {
 
 /// 递归清洗一个 schema 节点。
 ///
-/// 必须区分两种对象：**schema 对象**（按关键字剥）和 **`properties` 映射表**
-/// （键是参数名，一个都不能删）。搞混了就会把名叫 `title` / `const` 的参数
-/// 整个删掉，而 `required` 里还列着它，上游回 `required[2]: property is not defined`。
+/// 两条硬约束：
+/// 1. 必须区分 **schema 对象**（按键名过滤）和 **`properties` 映射表**
+///    （键是参数名，一个都不能删）。搞混了就会把名叫 `title` 的参数整个删掉，
+///    而 `required` 里还列着它，上游回 `required[2]: property is not defined`。
+/// 2. **每个节点都必须输出对象。** JSON Schema 允许布尔 schema（`true` /
+///    `false` / `null` 当整个 schema 用），原样透传就会在 `anyOf` 里塞进标量，
+///    protobuf 解析报 `Starting an object on a scalar field`。
 fn sanitize_node(value: &Value, defs: &Map<String, Value>, depth: usize) -> Value {
     if depth > MAX_REF_DEPTH {
-        return json!({ "type": "object" });
+        return json!({});
     }
     let resolved = deref(value, defs, depth);
     let Value::Object(map) = &resolved else {
-        return match &resolved {
-            Value::Array(items) => Value::Array(
-                items
-                    .iter()
-                    .map(|item| sanitize_node(item, defs, depth + 1))
-                    .collect(),
-            ),
-            other => other.clone(),
-        };
+        return json!({});
     };
 
     let mut out = Map::new();
+
+    // 组合子先处理：`allOf` 摊平进本层，`oneOf` / `anyOf` 归一到 `anyOf`。
+    // 顺序有讲究 —— 先摊 `allOf`，后面处理 `properties` 时才能往同一槽位里合并。
+    if let Some(entries) = map.get("allOf").and_then(Value::as_array) {
+        for branch in entries {
+            let cleaned = sanitize_node(branch, defs, depth + 1);
+            merge_into(&mut out, &cleaned);
+        }
+    }
+    for key in ["oneOf", "anyOf"] {
+        let Some(entries) = map.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let slot = out
+            .entry(String::from("anyOf"))
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(branches) = slot else {
+            continue;
+        };
+        for branch in entries {
+            // 分支必须是对象，否则 protobuf 直接拒。
+            branches.push(sanitize_node(branch, defs, depth + 1));
+        }
+    }
+
     for (key, item) in map {
-        if UNSUPPORTED_SCHEMA_KEYS.contains(&key.as_str()) {
+        if !ALLOWED_SCHEMA_KEYS.contains(&key.as_str()) {
             continue;
         }
         match key.as_str() {
-            // 属性映射表：键是参数名，只递归清洗它的值。
-            "properties" | "patternProperties" => {
+            "type" => {
+                if let Some((name, nullable)) = normalize_type(item) {
+                    out.insert(String::from("type"), Value::String(name));
+                    if nullable {
+                        out.insert(String::from("nullable"), Value::Bool(true));
+                    }
+                }
+            }
+            "format" => {
+                if let Some(text) = item.as_str() {
+                    if ALLOWED_FORMATS.contains(&text) {
+                        out.insert(key.clone(), Value::String(text.to_string()));
+                    }
+                }
+            }
+            "properties" => {
                 let Some(entries) = item.as_object() else {
                     continue;
                 };
-                let mut table = Map::new();
+                // `allOf` 可能已经往这里合并过一批属性，直接覆盖会把它们丢掉。
+                let slot = out
+                    .entry(String::from("properties"))
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let Value::Object(table) = slot else {
+                    continue;
+                };
                 for (name, schema) in entries {
                     table.insert(name.clone(), sanitize_node(schema, defs, depth + 1));
                 }
-                // `allOf` 可能已经往这里合并过一批属性（`allOf` 字母序在前），
-                // 直接覆盖会把它们丢掉。
-                let slot = out
-                    .entry(key.clone())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                let Value::Object(existing) = slot else {
-                    continue;
-                };
-                for (name, schema) in table {
-                    existing.insert(name, schema);
-                }
             }
-            // `required` 要等 `properties` 清洗完才能校验，先留着。
+            "items" => {
+                // JSON Schema 的元组形态（数组）Gemini 不支持，取第一项。
+                let schema = match item {
+                    Value::Array(items) => items.first().unwrap_or(&Value::Null),
+                    other => other,
+                };
+                out.insert(
+                    String::from("items"),
+                    sanitize_node(schema, defs, depth + 1),
+                );
+            }
+            // 已在上面按组合子处理过，这里跳过。
+            "anyOf" => {}
             "required" => {
                 let Some(incoming) = item.as_array() else {
                     continue;
                 };
                 let slot = out
-                    .entry(key.clone())
+                    .entry(String::from("required"))
                     .or_insert_with(|| Value::Array(Vec::new()));
                 let Value::Array(list) = slot else {
                     continue;
                 };
                 for name in incoming {
-                    if !list.contains(name) {
-                        list.push(name.clone());
+                    let Some(name) = name.as_str() else {
+                        continue;
+                    };
+                    if !list.iter().any(|known| known.as_str() == Some(name)) {
+                        list.push(Value::String(name.to_string()));
                     }
                 }
             }
-            // 已展开的 `$ref` 不该再出现在这里；展开不了的（悬空引用）直接丢。
-            "$ref" => {}
-            // Gemini 认 `anyOf` 不认 `oneOf` —— 语义最接近的降级。
-            "oneOf" | "anyOf" => {
-                let Some(entries) = item.as_array() else {
-                    continue;
-                };
-                let mut branches: Vec<Value> = out
-                    .remove("anyOf")
-                    .and_then(|existing| existing.as_array().cloned())
-                    .unwrap_or_default();
-                branches.extend(
-                    entries
-                        .iter()
-                        .map(|branch| sanitize_node(branch, defs, depth + 1)),
-                );
-                out.insert("anyOf".into(), Value::Array(branches));
-            }
-            "allOf" => {
-                let Some(entries) = item.as_array() else {
-                    continue;
-                };
-                for branch in entries {
-                    let cleaned = sanitize_node(branch, defs, depth + 1);
-                    merge_into(&mut out, &cleaned);
+            "nullable" => {
+                if let Some(flag) = item.as_bool() {
+                    out.insert(key.clone(), Value::Bool(flag));
                 }
             }
+            "enum" => {
+                let Some(items) = item.as_array() else {
+                    continue;
+                };
+                if !items.is_empty() {
+                    out.insert(key.clone(), Value::Array(items.clone()));
+                }
+            }
+            // 字符串型约束。
+            "description" | "pattern" => {
+                if let Some(text) = item.as_str() {
+                    if !text.is_empty() {
+                        out.insert(key.clone(), Value::String(text.to_string()));
+                    }
+                }
+            }
+            // 数值型约束。
             _ => {
-                out.insert(key.clone(), sanitize_node(item, defs, depth + 1));
+                if item.is_number() {
+                    out.insert(key.clone(), item.clone());
+                }
             }
         }
     }
 
     prune_required(&mut out);
+    infer_type(&mut out);
+    normalize_enum(&mut out);
     Value::Object(out)
+}
+
+/// 收拾 `enum`。
+///
+/// Gemini 的 `Schema.enum` 在 protobuf 里是 **`repeated string`** —— 塞布尔值
+/// 或数字进去会报 `Invalid value at ...enum`。而 JSON Schema 里
+/// `{"enum": [true, false]}` 很常见。
+///
+/// 处理办法：非字符串类型的枚举整个丢掉，只留 `type`。少一层取值约束换来请求
+/// 能成 —— 工具参数的取值范围本来就该由调用方自己校验。
+fn normalize_enum(out: &mut Map<String, Value>) {
+    let is_string = out.get("type").and_then(Value::as_str) == Some("string");
+    if is_string {
+        return;
+    }
+    out.remove("enum");
+}
+
+/// 补上缺失的 `type`。
+///
+/// JSON Schema 里 `type` 是可选的（`{"enum": [...]}`、`{"items": {...}}` 都合法），
+/// 但 Gemini 的 `Schema` 对这两种形态校验更严 —— 缺 `type` 时它可能把节点当成
+/// 空 schema，`enum` / `items` 就被静默忽略，工具参数校验随之失效。按 JSON
+/// Schema 的语义反推一个最贴近的类型。
+///
+/// 有 `anyOf` 时不推断：那种节点本身就是多态，硬塞一个 `type` 反而会收窄语义。
+fn infer_type(out: &mut Map<String, Value>) {
+    if out.contains_key("type") || out.contains_key("anyOf") {
+        return;
+    }
+    let inferred = if out
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|table| !table.is_empty())
+    {
+        Some("object")
+    } else if out.contains_key("items") {
+        Some("array")
+    } else {
+        // `enum` 只有一种值时按它的 JSON 类型走；混类型就按字符串。
+        out.get("enum")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .map(|first| match first {
+                Value::Bool(_) => "boolean",
+                Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+                Value::Number(_) => "number",
+                _ => "string",
+            })
+    };
+    if let Some(name) = inferred {
+        out.insert(String::from("type"), Value::String(String::from(name)));
+    }
 }
 
 /// OpenAI 的 `data:` 图片 URL → Gemini 的 `inlineData`。
@@ -1008,6 +1165,209 @@ mod tests {
             .unwrap_or_default();
         required.sort();
         assert_eq!(required, vec!["fromAllOf".to_string(), "sibling".to_string()]);
+    }
+
+    #[test]
+    fn boolean_schemas_never_reach_the_anyof_branches() {
+        // JSON Schema 允许 `true` / `{}` 当整个 schema 用。原样塞进 anyOf 就是
+        // `Starting an object on a scalar field`。
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "pick",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "choice": { "anyOf": [true, { "type": "string" }, null, false] }
+                    }
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let branches = out
+            .body
+            .pointer("/tools/0/functionDeclarations/0/parameters/properties/choice/anyOf")
+            .and_then(Value::as_array)
+            .expect("anyOf 还在");
+        assert_eq!(branches.len(), 4, "分支数量不变，但每个都要变成对象");
+        for branch in branches {
+            assert!(branch.is_object(), "anyOf 分支必须是对象，实际是 {branch}");
+        }
+    }
+
+    #[test]
+    fn array_types_collapse_to_one_enum_value() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "maybe": { "type": ["string", "null"] },
+                        "either": { "type": ["integer", "string"] },
+                        "weird": { "type": "dict" }
+                    }
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let props = out
+            .body
+            .pointer("/tools/0/functionDeclarations/0/parameters/properties")
+            .unwrap();
+        assert_eq!(props.pointer("/maybe/type").and_then(Value::as_str), Some("string"));
+        assert_eq!(
+            props.pointer("/maybe/nullable").and_then(Value::as_bool),
+            Some(true),
+            "null 要转成 nullable"
+        );
+        assert_eq!(props.pointer("/either/type").and_then(Value::as_str), Some("integer"));
+        assert_eq!(props.pointer("/weird/type").and_then(Value::as_str), Some("object"));
+        for name in ["maybe", "either", "weird"] {
+            assert!(
+                props.pointer(&format!("/{name}/type")).map(Value::is_string) == Some(true),
+                "{name} 的 type 必须是标量"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_and_formats_are_dropped() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "x-custom": "nope",
+                    "contentMediaType": "image/png",
+                    "properties": {
+                        "when": { "type": "string", "format": "date-time" },
+                        "bad": { "type": "string", "format": "uri-template" },
+                        "amount": { "type": "number", "minimum": 0, "exclusiveMinimum": 1 }
+                    }
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let parameters = out.body.pointer("/tools/0/functionDeclarations/0/parameters").unwrap();
+        assert!(parameters.get("x-custom").is_none());
+        assert!(parameters.get("contentMediaType").is_none());
+        assert_eq!(
+            parameters.pointer("/properties/when/format").and_then(Value::as_str),
+            Some("date-time")
+        );
+        assert!(
+            parameters.pointer("/properties/bad/format").is_none(),
+            "不认识的 format 会报 Invalid value，必须丢"
+        );
+        assert_eq!(
+            parameters.pointer("/properties/amount/minimum").and_then(Value::as_f64),
+            Some(0.0)
+        );
+        assert!(parameters.pointer("/properties/amount/exclusiveMinimum").is_none());
+    }
+
+    #[test]
+    fn tuple_items_fall_back_to_the_first_schema() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pair": { "type": "array", "items": [{ "type": "string" }, { "type": "number" }] }
+                    }
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let items = out
+            .body
+            .pointer("/tools/0/functionDeclarations/0/parameters/properties/pair/items")
+            .unwrap();
+        assert!(items.is_object(), "元组 items 要收成单个 schema 对象");
+        assert_eq!(items.get("type").and_then(Value::as_str), Some("string"));
+    }
+
+    #[test]
+    fn every_node_in_a_deep_schema_is_an_object() {
+        // 递归类型：数组 → anyOf → 对象 → 数组 …，每一层都必须还是对象。
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "walk",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tree": {
+                            "anyOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "anyOf": [
+                                            { "type": "number" },
+                                            { "type": "object", "properties": { "leaf": { "type": "boolean" } } }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let tree = out
+            .body
+            .pointer("/tools/0/functionDeclarations/0/parameters/properties/tree")
+            .unwrap();
+        let mut stack = vec![tree];
+        while let Some(node) = stack.pop() {
+            assert!(node.is_object(), "节点必须是对象，实际是 {node}");
+            if let Some(branches) = node.get("anyOf").and_then(Value::as_array) {
+                stack.extend(branches);
+            }
+            if let Some(items) = node.get("items") {
+                stack.push(items);
+            }
+            if let Some(props) = node.get("properties").and_then(Value::as_object) {
+                stack.extend(props.values());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_types_are_inferred() {
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "f",
+                "parameters": {
+                    "properties": {
+                        "obj": { "properties": { "a": { "type": "string" } } },
+                        "arr": { "items": { "type": "string" } },
+                        "col": { "enum": [true, false] },
+                        "num": { "enum": [1, 2, 3] },
+                        "poly": { "anyOf": [{ "type": "string" }, { "type": "number" }] }
+                    }
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let parameters = out.body.pointer("/tools/0/functionDeclarations/0/parameters").unwrap();
+        assert_eq!(parameters.get("type").and_then(Value::as_str), Some("object"));
+        assert_eq!(parameters.pointer("/properties/obj/type").and_then(Value::as_str), Some("object"));
+        assert_eq!(parameters.pointer("/properties/arr/type").and_then(Value::as_str), Some("array"));
+        assert_eq!(parameters.pointer("/properties/col/type").and_then(Value::as_str), Some("boolean"));
+        assert_eq!(parameters.pointer("/properties/num/type").and_then(Value::as_str), Some("integer"));
+        assert!(
+            parameters.pointer("/properties/poly/type").is_none(),
+            "多态节点不该被硬塞 type"
+        );
     }
 
     #[test]
