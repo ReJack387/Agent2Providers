@@ -277,11 +277,34 @@ fn sanitize_node(value: &Value, defs: &Map<String, Value>, depth: usize) -> Valu
                 for (name, schema) in entries {
                     table.insert(name.clone(), sanitize_node(schema, defs, depth + 1));
                 }
-                out.insert(key.clone(), Value::Object(table));
+                // `allOf` 可能已经往这里合并过一批属性（`allOf` 字母序在前），
+                // 直接覆盖会把它们丢掉。
+                let slot = out
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let Value::Object(existing) = slot else {
+                    continue;
+                };
+                for (name, schema) in table {
+                    existing.insert(name, schema);
+                }
             }
             // `required` 要等 `properties` 清洗完才能校验，先留着。
             "required" => {
-                out.insert(key.clone(), item.clone());
+                let Some(incoming) = item.as_array() else {
+                    continue;
+                };
+                let slot = out
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                let Value::Array(list) = slot else {
+                    continue;
+                };
+                for name in incoming {
+                    if !list.contains(name) {
+                        list.push(name.clone());
+                    }
+                }
             }
             // 已展开的 `$ref` 不该再出现在这里；展开不了的（悬空引用）直接丢。
             "$ref" => {}
@@ -954,6 +977,37 @@ mod tests {
             Some(2)
         );
         assert!(parameters.pointer("/properties/never/not").is_none(), "not 要丢掉");
+    }
+
+    #[test]
+    fn all_of_and_sibling_properties_are_both_kept() {
+        // `allOf` 字母序在 `properties` 之前，合并完再被同层的 `properties`
+        // 覆盖就会静默丢属性。
+        let body = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "save",
+                "parameters": {
+                    "type": "object",
+                    "allOf": [
+                        { "properties": { "fromAllOf": { "type": "string" } }, "required": ["fromAllOf"] }
+                    ],
+                    "properties": { "sibling": { "type": "string" } },
+                    "required": ["sibling"]
+                }
+            }}]
+        });
+        let out = build_upstream_body(&body, "gemini-2.5-flash", None);
+        let parameters = out.body.pointer("/tools/0/functionDeclarations/0/parameters").unwrap();
+        assert!(parameters.pointer("/properties/fromAllOf").is_some(), "allOf 合并的属性丢了");
+        assert!(parameters.pointer("/properties/sibling").is_some(), "同层 properties 丢了");
+        let mut required: Vec<String> = parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        required.sort();
+        assert_eq!(required, vec!["fromAllOf".to_string(), "sibling".to_string()]);
     }
 
     #[test]
