@@ -552,6 +552,11 @@ fn content_to_parts(content: &Value, parts: &mut Vec<Value>) {
 }
 
 /// assistant 的 `tool_calls` → `functionCall` parts，同时登记 id→name。
+///
+/// 每个 part 都要补 `thoughtSignature`：Gemini 对**历史回放**里的
+/// `functionCall` 强制要求它，不带就是 400（「Function call is missing a
+/// thought_signature in functionCall parts」）。客户端带了就用它的，没带就查
+/// 插件缓存，再没有就用官方哨兵 —— 细节见 `signatures` 模块。
 fn assistant_tool_parts(tool_calls: &Value, parts: &mut Vec<Value>, names: &mut Map<String, Value>) {
     let Some(calls) = tool_calls.as_array() else {
         return;
@@ -566,16 +571,30 @@ fn assistant_tool_parts(tool_calls: &Value, parts: &mut Vec<Value>, names: &mut 
         if name.is_empty() {
             continue;
         }
-        let args = match call.pointer("/function/arguments") {
-            Some(Value::String(text)) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
-            Some(other) => other.clone(),
-            None => Value::Null,
+        let raw_arguments = match call.pointer("/function/arguments") {
+            Some(Value::String(text)) => text.clone(),
+            Some(other) => other.to_string(),
+            None => String::from("{}"),
         };
-        let args = if args.is_object() { args } else { json!({}) };
-        if let Some(id) = call.get("id").and_then(Value::as_str) {
-            names.insert(id.to_string(), Value::String(name.clone()));
+        let args = match serde_json::from_str::<Value>(&raw_arguments) {
+            Ok(value) if value.is_object() => value,
+            _ => match call.pointer("/function/arguments") {
+                Some(other) if other.is_object() => other.clone(),
+                _ => json!({}),
+            },
+        };
+        let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !call_id.is_empty() {
+            names.insert(call_id.to_string(), Value::String(name.clone()));
         }
-        parts.push(json!({ "functionCall": { "name": name, "args": args } }));
+        let mut part = Map::new();
+        part.insert(
+            String::from("functionCall"),
+            json!({ "name": name, "args": args }),
+        );
+        let carried = super::signatures::carried_signature(call);
+        super::signatures::fill_part(&mut part, carried.as_deref(), call_id);
+        parts.push(Value::Object(part));
     }
 }
 

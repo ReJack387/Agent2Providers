@@ -31,6 +31,7 @@ pub mod login;
 pub mod models;
 pub mod protocol;
 pub mod proxy;
+pub mod signatures;
 pub mod stream;
 
 use agent2api_provider_protocol as proto;

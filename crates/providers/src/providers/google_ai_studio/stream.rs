@@ -98,6 +98,8 @@ pub enum Delta {
         id: String,
         name: String,
         arguments: String,
+        /// 模型给这次调用打的签名。客户端若原样带回来，下一轮就不用靠缓存兜。
+        signature: Option<String>,
     },
 }
 
@@ -137,6 +139,13 @@ pub struct Translator {
     pub model_version: String,
     pub saw_tool_call: bool,
     pub emitted: bool,
+    /// call id 的随机前缀。
+    ///
+    /// **call id 必须跨响应唯一。** 客户端会把整段历史一起发回来，两轮里各有一个
+    /// 「第 0 个工具调用」，如果 id 都叫 `call_0`，签名缓存就会串键 —— 后一轮的
+    /// 签名盖掉前一轮，回放时上游要么报 `Corrupted thought signature`，要么按
+    /// 错签名理解上下文。加一段随机前缀就能让每一轮的各次调用天然不撞。
+    nonce: String,
 }
 
 impl Translator {
@@ -148,6 +157,7 @@ impl Translator {
             model_version: String::new(),
             saw_tool_call: false,
             emitted: false,
+            nonce: crate::ids::new_message_id(),
         }
     }
 
@@ -192,11 +202,20 @@ impl Translator {
                     let index = self.tool_index;
                     self.tool_index += 1;
                     self.saw_tool_call = true;
+                    // 带 nonce，跨响应不撞（见 `Translator::nonce` 的注释）。
+                    let id = format!("call_{}_{index}", self.nonce);
+                    // 签名必须存下来：下一轮客户端回传工具结果时，上游要求
+                    // 历史里的 `functionCall` 带着它，否则 400。
+                    let signature = super::signatures::signature_of(part);
+                    if let Some(value) = signature.as_deref() {
+                        super::signatures::remember(&id, value);
+                    }
                     deltas.push(Delta::ToolCall {
                         index,
-                        id: format!("call_{index}"),
+                        id,
                         name,
                         arguments,
+                        signature,
                     });
                     continue;
                 }

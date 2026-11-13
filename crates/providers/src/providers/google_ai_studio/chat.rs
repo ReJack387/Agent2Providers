@@ -344,14 +344,25 @@ async fn drive(
                     id: call_id,
                     name,
                     arguments,
-                } => json!({
-                    "tool_calls": [{
-                        "index": index,
-                        "id": call_id,
-                        "type": "function",
-                        "function": { "name": name, "arguments": arguments },
-                    }]
-                }),
+                    signature,
+                } => {
+                    let mut payload = json!({
+                        "tool_calls": [{
+                            "index": index,
+                            "id": call_id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments },
+                        }]
+                    });
+                    // 把签名随 tool_call 一起下发。多数客户端会丢掉这个非标字段，
+                    // 那时靠插件自己的缓存兜（见 signatures 模块）；但 Google 自家
+                    // SDK 会原样带回来，那条路更可靠。
+                    if let Some(value) = signature {
+                        payload["tool_calls"][0]["extra_content"] =
+                            json!({ "google": { "thought_signature": value } });
+                    }
+                    payload
+                }
             };
             sink.send(&delta_frame(&id, model, created, payload, None))
                 .await
